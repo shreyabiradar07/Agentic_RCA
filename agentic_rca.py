@@ -3,7 +3,7 @@ import os
 
 from transformers import pipeline
 
-LLM_MODEL_NAME = "google/flan-t5-large"  # Example model
+LLM_MODEL_NAME = "declare-lab/flan-alpaca-large"
 
 
 class ObservationAgent:
@@ -26,7 +26,7 @@ class ContextualizationAgent:
 
     def gather_initial_context(self, trigger_info):
         frontend_service = trigger_info["frontend_service"]
-        dependencies = self._get_dependencies(frontend_service)
+        dependencies = self._collect_all_dependencies(frontend_service)
         return {"frontend_service": frontend_service, "dependencies": dependencies}
 
     def _get_dependencies(self, service):
@@ -105,6 +105,7 @@ class HypothesisGenerationAgent:
         initial_hypotheses = self._graph_traversal_hypotheses(frontend_service)
         llm_suggestions = self._llm_powered_suggestions(frontend_service, dependencies,
                                                         metrics_logs) if self.llm else []
+        print("Hypothesis: ", initial_hypotheses+llm_suggestions)
         return self._prioritize_hypotheses(initial_hypotheses + llm_suggestions)
 
     def _graph_traversal_hypotheses(self, start_service):
@@ -115,7 +116,7 @@ class HypothesisGenerationAgent:
         while queue:
             current_service, path = queue.pop(0)
             if "database" in current_service.lower():
-                hypotheses.append(f"Potential slow query in {current_service}")
+                hypotheses.append(f"Potential slow queries in {current_service}")
             for relation in self.knowledge_graph.get(current_service, {}):
                 if relation in ["depends_on", "calls"]:
                     for neighbor in self.knowledge_graph[current_service][relation]:
@@ -128,9 +129,9 @@ class HypothesisGenerationAgent:
 
     def _llm_powered_suggestions(self, frontend_service, dependencies, metrics_logs):
         if self.llm:
-            prompt = f"The frontend service '{frontend_service}' is slow because its backend dependency '{dependencies[0]}' might be slow. Suggest up to 2 concise and distinct potential underlying causes for performance issues in these backend services or their communication."
+            prompt = f"The frontend service '{frontend_service}' is slow because its backend dependency '{dependencies[0]}' is under high latency due to slower database queries. What are the two concise potential underlying causes for slow database queries"
             try:
-                response = self.llm(prompt, max_length=80, num_return_sequences=1, do_sample=True, top_k=30, top_p=0.8)
+                response = self.llm(prompt, max_length=200, num_return_sequences=1, do_sample=True, top_k=30, top_p=0.8)
                 suggestion = response[0]['generated_text'].strip()
                 if suggestion and "faulty service key" not in suggestion.lower():
                     return [f"(LLM Suggestion) {suggestion}"]
@@ -196,15 +197,33 @@ class ReasoningCorrelationAgent:
 
     def correlate_evidence(self, context, evidence):
         reasoning = []
-        if evidence.get("DatabaseX", {}).get("logs", []) and "Slow query detected" in evidence["DatabaseX"]["logs"] and \
-                evidence.get("ServiceA", {}).get("metrics", {}).get("response_time", 0) > 0.5:
-            return {"root_cause": "Slow query in DatabaseX causing high latency in ServiceA.",
-                    "reasoning": ["High latency in ServiceA", "Slow query detected in DatabaseX"]}
-        elif evidence.get("ServiceA", {}).get("metrics", {}).get("response_time", 0) > 0.5:
-            return {"root_cause": "High latency in ServiceA is impacting the frontend.",
-                    "reasoning": ["High latency in ServiceA"]}
-        return {"root_cause": "Could not definitively determine the root cause with the current evidence.",
-                "reasoning": []}
+
+        db_logs = evidence.get("DatabaseX", {}).get("logs", [])
+        service_latency = evidence.get("ServiceA", {}).get("metrics", {}).get("response_time", 0)
+
+        # Look for logs that mention a slow query
+        slow_query_logs = [log for log in db_logs if log.lower().startswith("slow query:")]
+
+        if slow_query_logs and service_latency > 0.5:
+            reasoning.append("High latency in ServiceA")
+            reasoning.append(f"Slow query detected in DatabaseX: {slow_query_logs[0]}")
+            return {
+                "root_cause": "Slow DatabaseX queries causing high latency in ServiceA.",
+                "reasoning": reasoning
+            }
+
+        elif service_latency > 0.5:
+            reasoning.append("High latency in ServiceA")
+            return {
+                "root_cause": "High latency in ServiceA is impacting the frontend.",
+                "reasoning": reasoning
+            }
+
+        return {
+            "root_cause": "Could not definitively determine the root cause with the current evidence.",
+            "reasoning": []
+        }
+
 
 
 class ExplanationReportingAgent:
@@ -219,26 +238,54 @@ class ExplanationReportingAgent:
     def generate_report(self, root_cause_analysis, context, evidence):
         root_cause = root_cause_analysis.get("root_cause", "Unknown")
         reasoning = root_cause_analysis.get("reasoning", [])
-        explanation = f"The likely root cause of the frontend slowdown on '{context['frontend_service']}' is: {root_cause}. "
+
+        explanation = (
+            f"The likely root cause of the frontend slowdown on '{context['frontend_service']}' is: {root_cause}. "
+        )
+
         if reasoning and self.llm:
             prompt = ""
-            if "High latency in ServiceA" in root_cause:
-                prompt = f"The frontend is slow, and its dependency 'ServiceA' has high latency. Suggest several specific troubleshooting steps solving the issue faced."
-                if "Slow query in DatabaseX" in root_cause:
-                    prompt = f"The frontend is slow, 'ServiceA' has high latency, likely due to slow queries in its database 'DatabaseX'. List specific troubleshooting actions for slow database queries and backend code that interacts with the database."
-            else:
-                prompt = f"The frontend is slow. Based on the evidence: '{', '.join(reasoning)}', suggest specific troubleshooting actions for a frontend slowdown in a multi-service architecture."
 
-            if prompt:
-                try:
-                    response = self.llm(prompt, max_length=200, num_return_sequences=1)
-                    explanation += "Possible Solutions: " + response[0]['generated_text'].strip()
-                except Exception as e:
-                    explanation += f"Reasoning: {', '.join(reasoning)}"
+            # Priority case: Slow DB query causing high ServiceA latency
+            if "Slow DatabaseX queries causing high latency in ServiceA." in root_cause:
+                prompt = (
+                    "The frontend is experiencing slowdown. ServiceA shows high response latency, "
+                    "which is likely caused by slow database queries in DatabaseX. "
+                    "List 3 specific actions a backend engineer can take to fix slow SQL queries. Number the steps."
+                )
+
+            # Fallback: just high latency in backend service
+            elif "high latency in ServiceA" in root_cause:
+                prompt = (
+                    "The frontend is slow, and its dependency 'ServiceA' is experiencing high latency. "
+                    "Suggest specific troubleshooting steps to reduce latency in a backend service, especially when involving database performance."
+                )
+
+            # General fallback: unclear RCA, but some evidence
             else:
+                prompt = (
+                    f"The frontend is slow. Based on the evidence: '{', '.join(reasoning)}', "
+                    "suggest specific troubleshooting actions for a frontend slowdown in a distributed service architecture."
+                )
+
+
+            try:
+                response = self.llm(
+                    prompt,
+                    max_length=300,
+                    num_return_sequences=1,
+                    do_sample=True,
+                    temperature=0.7,
+                )
+                explanation += "Possible Solutions: " + response[0]['generated_text'].strip()
+            except Exception as e:
                 explanation += f"Reasoning: {', '.join(reasoning)}"
+
         else:
             explanation += f"Reasoning: {', '.join(reasoning)}"
+
+        print("Generated Report:")
+        print(explanation)
         return {"report": explanation}
 
 
@@ -263,37 +310,6 @@ class FeedbackAgent:
         return current_knowledge  # Return the (potentially updated) knowledge
 
 
-# class RCAAgent:
-#     def __init__(self, knowledge_graph, monitoring_config, logging_data, llm=None):
-#         self.observation_agent = ObservationAgent()
-#         self.contextualization_agent = ContextualizationAgent(knowledge_graph, monitoring_config, logging_data)
-#         self.hypothesis_generation_agent = HypothesisGenerationAgent(knowledge_graph, llm)
-#         self.evidence_gathering_agent = EvidenceGatheringAgent(monitoring_config, logging_data)
-#         self.reasoning_correlation_agent = ReasoningCorrelationAgent(knowledge_graph) # Pass knowledge_graph here
-#         self.explanation_reporting_agent = ExplanationReportingAgent()
-#         self.feedback_agent = FeedbackAgent()
-#         self.knowledge_graph = knowledge_graph
-#
-#
-#     def run_rca(self):
-#         """Orchestrates the root cause analysis workflow."""
-#         trigger_info = self.observation_agent.detect_frontend_slowdown()
-#         if trigger_info:
-#             print("Frontend slowdown detected. Initiating RCA...")
-#             # Gather initial context using the ContextualizationAgent
-#             context = self.contextualization_agent.gather_initial_context(trigger_info)
-#             metrics_logs = self.contextualization_agent.fetch_relevant_metrics_and_logs(context)
-#             hypotheses = self.hypothesis_generation_agent.generate_hypotheses(context, metrics_logs)
-#             print(f"Generated Hypotheses: {hypotheses}")
-#             evidence = self.evidence_gathering_agent.gather_evidence(hypotheses, context)
-#             root_cause_analysis = self.reasoning_correlation_agent.correlate_evidence(context, evidence)
-#             report = self.explanation_reporting_agent.generate_report(root_cause_analysis)
-#             feedback = self.feedback_agent.gather_feedback(report)
-#             self.knowledge_graph = self.feedback_agent.update_knowledge(feedback, self.knowledge_graph)
-#         else:
-#             print("No frontend slowdown detected.")
-
-
 class RCAAgent:
     def __init__(self, knowledge_graph, logging_data, monitoring_data_simulated, use_llm=None):
         self.observation_agent = ObservationAgent()
@@ -306,44 +322,28 @@ class RCAAgent:
         self.knowledge_graph = knowledge_graph
 
     def run_rca(self):
-        """Orchestrates the root cause analysis workflow."""
+        """Orchestrates the root cause analysis workflow and returns the report."""
         trigger_info = self.observation_agent.detect_frontend_slowdown()
         if trigger_info:
-            print("Frontend slowdown detected. Initiating RCA...")
-            # Gather initial context using the ContextualizationAgent
             context = self.contextualization_agent.gather_initial_context(trigger_info)
             metrics_logs = self.contextualization_agent.fetch_relevant_metrics_and_logs(context)
             hypotheses = self.hypothesis_generation_agent.generate_hypotheses(context, metrics_logs)
-            print(f"Generated Hypotheses: {hypotheses}")
             evidence = self.evidence_gathering_agent.gather_evidence(hypotheses, context, metrics_logs)
             root_cause_analysis = self.reasoning_correlation_agent.correlate_evidence(context, evidence)
             report = self.explanation_reporting_agent.generate_report(root_cause_analysis, context, evidence)
-            feedback = self.feedback_agent.gather_feedback(report)
-            self.knowledge_graph = self.feedback_agent.update_knowledge(feedback, self.knowledge_graph)
-        else:
-            print("No frontend slowdown detected.")
 
+            return report["report"]
 
-# Simulate the knowledge graph, monitoring data, and logging data
-# knowledge_graph_data = {
-#     "WebFrontend": {"depends_on": ["ServiceA"], "alerts": []},
-#     "ServiceA": {"depends_on": ["DatabaseX"], "calls": ["DatabaseX"], "alerts": [{"timestamp": "2025-05-09T09:45:00Z", "message": "High CPU usage"}], "recent_changes": [{"timestamp": "2025-05-08T18:00:00Z", "service": "ServiceA", "change": "Increased connection pool size"}]},
-#     "DatabaseX": {"used_by": ["ServiceA"], "alerts": [{"timestamp": "2025-05-09T09:50:00Z", "message": "High query latency"}]}
-# }
+        return "No frontend slowdown detected."
 
-# monitoring_data_simulated = {
-#     "WebFrontend": {"p99_latency": 0.8},
-#     "ServiceA": {"response_time": 0.6},
-#     "DatabaseX": {"query_execution_time": 1.2, "cpu_utilization": 0.7, "detailed": {"slowest_queries": ["SELECT * FROM users WHERE id = ? (1.1s)"]}}
-# }
 
 def generate_monitoring_data():
     return {
         "WebFrontend": {"p99_latency": round(random.uniform(0.6, 0.9), 2)},
-        "ServiceA": {"response_time": round(random.uniform(0.4, 0.8), 2)},
+        "ServiceA": {"response_time": round(random.uniform(0.5, 0.8), 2)},
         "DatabaseX": {
             "query_execution_time": round(random.uniform(0.8, 1.3), 2),
-            "cpu_utilization": round(random.uniform(0.5, 0.8), 2),
+            "cpu_utilization": round(random.uniform(0.4, 0.8), 2),
             "detailed": {
                 "slowest_queries": [random.choice([
                     "SELECT * FROM users WHERE id = ? (1.1s)",
@@ -357,8 +357,7 @@ def generate_monitoring_data():
 logging_data_simulated = {
     "WebFrontend": ["Request to /api/data took 0.7s"],
     "ServiceA": ["Calling DatabaseX...", "DatabaseX response took 1.1s"],
-    "DatabaseX": ["Slow query: SELECT * FROM users WHERE id = ? took 1.1s", "Connection established",
-                  "Query completed in 0.01s"]
+    "DatabaseX": ["Slow query: UPDATE inventory SET stock = stock - 1 WHERE product_id IN (SELECT id FROM products WHERE discontinued = false) (1.05s)"]
 }
 
 # Simulate the knowledge graph and logging data
